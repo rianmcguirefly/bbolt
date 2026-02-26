@@ -14,12 +14,12 @@ import (
 )
 
 type freelistInspectOptions struct {
-	limit       int
-	prefixLen   int
-	showKeys    bool
-	maxKeysShow int
-	sampleSize  int
-	noProgress  bool
+	limit      int
+	separator  string
+	segments   int
+	showKeys   bool
+	sampleSize int
+	noProgress bool
 }
 
 func newFreelistInspectCommand() *cobra.Command {
@@ -48,9 +48,9 @@ identify which buckets the deleted data came from.
 
 func (o *freelistInspectOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVarP(&o.limit, "limit", "n", 20, "number of key prefixes to show")
-	fs.IntVar(&o.prefixLen, "prefix-len", 16, "key prefix length for grouping")
+	fs.StringVar(&o.separator, "sep", "#", "separator character for key segments")
+	fs.IntVar(&o.segments, "segments", 2, "number of segments to include in prefix")
 	fs.BoolVar(&o.showKeys, "show-keys", false, "show sample keys for each prefix")
-	fs.IntVar(&o.maxKeysShow, "max-keys", 3, "max sample keys to show per prefix")
 	fs.IntVar(&o.sampleSize, "sample", 0, "sample N random pages instead of reading all (0 = read all)")
 	fs.BoolVar(&o.noProgress, "no-progress", false, "disable progress indicator")
 }
@@ -122,11 +122,13 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 
 	// Analyze each free page
 	var (
-		leafPages   int
-		branchPages int
-		otherPages  int
-		totalKeys   int
-		prefixMap   = make(map[string]*prefixStats)
+		leafPages     int
+		branchPages   int
+		otherPages    int
+		overflowPages int
+		unattributed  int
+		totalKeys     int
+		prefixMap     = make(map[string]*prefixStats)
 	)
 
 	totalToScan := len(pagesToScan)
@@ -152,31 +154,54 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		case p.IsLeafPage():
 			leafPages++
 			// Extract keys from leaf page
-			for i := uint16(0); i < p.Count(); i++ {
-				elem := p.LeafPageElement(i)
-				key := elem.Key()
-				totalKeys++
-
-				// Get prefix for grouping
-				prefix := truncateKey(key, o.prefixLen)
-
-				stats, exists := prefixMap[prefix]
-				if !exists {
-					stats = &prefixStats{prefix: prefix}
-					prefixMap[prefix] = stats
-				}
-				stats.keyCount++
-				stats.byteSize += int64(elem.Ksize() + elem.Vsize())
-				if stats.sampleKey == "" {
-					stats.sampleKey = bytesToAsciiOrHex(key)
-				}
-			}
+			o.processLeafPage(p, prefixMap, &totalKeys)
 
 		case p.IsBranchPage():
 			branchPages++
 
 		default:
+			// Try to find parent leaf page for overflow pages
 			otherPages++
+			parentFound := false
+
+			// Scan backwards to find parent leaf page (up to 1000 pages back)
+			for back := uint64(1); back <= 1000 && uint64(pgid) >= back; back++ {
+				parentID := uint64(pgid) - back
+				parentPage, _, err := guts_cli.ReadPage(dbPath, parentID)
+				if err != nil {
+					continue
+				}
+
+				// Check if this page's overflow covers our page
+				if parentPage.IsLeafPage() && uint64(parentPage.Overflow()) >= back {
+					// Found the parent - attribute overflow size to its keys
+					overflowPages++
+					parentFound = true
+
+					// Attribute to the last key (usually the large one causing overflow)
+					if parentPage.Count() > 0 {
+						elem := parentPage.LeafPageElement(parentPage.Count() - 1)
+						key := elem.Key()
+						prefix := extractPrefix(key, o.separator, o.segments)
+
+						stats, exists := prefixMap[prefix]
+						if !exists {
+							stats = &prefixStats{prefix: prefix}
+							prefixMap[prefix] = stats
+						}
+						// Add one page worth of size for this overflow page
+						stats.byteSize += int64(pageSize)
+						if stats.sampleKey == "" {
+							stats.sampleKey = bytesToAsciiOrHex(key)
+						}
+					}
+					break
+				}
+			}
+
+			if !parentFound {
+				unattributed++
+			}
 		}
 	}
 
@@ -188,17 +213,29 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 	// Print page type breakdown (extrapolate if sampling)
 	fmt.Fprintln(stdout, "Page type breakdown:")
 	if sampleRatio > 1.0 {
-		fmt.Fprintf(stdout, "  Leaf pages:   ~%d (sampled %d)\n", int(float64(leafPages)*sampleRatio), leafPages)
-		fmt.Fprintf(stdout, "  Branch pages: ~%d (sampled %d)\n", int(float64(branchPages)*sampleRatio), branchPages)
-		if otherPages > 0 {
-			fmt.Fprintf(stdout, "  Other/overflow: ~%d (sampled %d)\n", int(float64(otherPages)*sampleRatio), otherPages)
+		fmt.Fprintf(stdout, "  Leaf pages:       ~%d (sampled %d)\n", int(float64(leafPages)*sampleRatio), leafPages)
+		fmt.Fprintf(stdout, "  Branch pages:     ~%d (sampled %d)\n", int(float64(branchPages)*sampleRatio), branchPages)
+		if overflowPages > 0 {
+			fmt.Fprintf(stdout, "  Overflow (attributed): ~%d (sampled %d)\n", int(float64(overflowPages)*sampleRatio), overflowPages)
 		}
-		fmt.Fprintf(stdout, "  Total keys: ~%d (sampled %d)\n\n", int(float64(totalKeys)*sampleRatio), totalKeys)
+		if unattributed > 0 {
+			fmt.Fprintf(stdout, "  Overflow (unknown):    ~%d (sampled %d)\n", int(float64(unattributed)*sampleRatio), unattributed)
+		}
+		if otherPages > 0 && otherPages != overflowPages+unattributed {
+			fmt.Fprintf(stdout, "  Other:            ~%d (sampled %d)\n", int(float64(otherPages)*sampleRatio), otherPages)
+		}
+		fmt.Fprintf(stdout, "  Total keys:       ~%d (sampled %d)\n\n", int(float64(totalKeys)*sampleRatio), totalKeys)
 	} else {
-		fmt.Fprintf(stdout, "  Leaf pages:   %d\n", leafPages)
-		fmt.Fprintf(stdout, "  Branch pages: %d\n", branchPages)
-		if otherPages > 0 {
-			fmt.Fprintf(stdout, "  Other/overflow: %d\n", otherPages)
+		fmt.Fprintf(stdout, "  Leaf pages:       %d\n", leafPages)
+		fmt.Fprintf(stdout, "  Branch pages:     %d\n", branchPages)
+		if overflowPages > 0 {
+			fmt.Fprintf(stdout, "  Overflow (attributed): %d\n", overflowPages)
+		}
+		if unattributed > 0 {
+			fmt.Fprintf(stdout, "  Overflow (unknown):    %d\n", unattributed)
+		}
+		if otherPages > 0 && otherPages != overflowPages+unattributed {
+			fmt.Fprintf(stdout, "  Other:            %d\n", otherPages)
 		}
 		fmt.Fprintf(stdout, "  Total keys found: %d\n\n", totalKeys)
 	}
@@ -222,20 +259,33 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		prefixes = prefixes[:o.limit]
 	}
 
+	// Calculate max prefix width for formatting
+	maxPrefixWidth := 20
+	for _, stats := range prefixes {
+		if len(stats.prefix) > maxPrefixWidth {
+			maxPrefixWidth = len(stats.prefix)
+		}
+	}
+	if maxPrefixWidth > 60 {
+		maxPrefixWidth = 60
+	}
+
 	// Print results
 	if sampleRatio > 1.0 {
-		fmt.Fprintf(stdout, "Top %d key prefixes in freed pages (prefix-len=%d, extrapolated):\n\n", len(prefixes), o.prefixLen)
-		fmt.Fprintf(stdout, "%-*s %10s %10s\n", o.prefixLen+2, "PREFIX", "~KEYS", "~SIZE")
+		fmt.Fprintf(stdout, "Top %d key prefixes in freed pages (sep=%q, segments=%d, extrapolated):\n\n",
+			len(prefixes), o.separator, o.segments)
+		fmt.Fprintf(stdout, "%-*s %10s %10s\n", maxPrefixWidth, "PREFIX", "~KEYS", "~SIZE")
 	} else {
-		fmt.Fprintf(stdout, "Top %d key prefixes in freed pages (prefix-len=%d):\n\n", len(prefixes), o.prefixLen)
-		fmt.Fprintf(stdout, "%-*s %10s %10s\n", o.prefixLen+2, "PREFIX", "KEYS", "SIZE")
+		fmt.Fprintf(stdout, "Top %d key prefixes in freed pages (sep=%q, segments=%d):\n\n",
+			len(prefixes), o.separator, o.segments)
+		fmt.Fprintf(stdout, "%-*s %10s %10s\n", maxPrefixWidth, "PREFIX", "KEYS", "SIZE")
 	}
-	fmt.Fprintf(stdout, "%s\n", strings.Repeat("-", o.prefixLen+2+10+10+2))
+	fmt.Fprintf(stdout, "%s\n", strings.Repeat("-", maxPrefixWidth+10+10+2))
 
 	for _, stats := range prefixes {
 		displayPrefix := stats.prefix
-		if len(displayPrefix) > o.prefixLen {
-			displayPrefix = displayPrefix[:o.prefixLen]
+		if len(displayPrefix) > maxPrefixWidth {
+			displayPrefix = displayPrefix[:maxPrefixWidth-3] + "..."
 		}
 		keyCount := stats.keyCount
 		byteSize := stats.byteSize
@@ -244,7 +294,7 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 			byteSize = int64(float64(byteSize) * sampleRatio)
 		}
 		fmt.Fprintf(stdout, "%-*s %10d %10s\n",
-			o.prefixLen+2,
+			maxPrefixWidth,
 			displayPrefix,
 			keyCount,
 			formatSize(int(byteSize)),
@@ -261,11 +311,44 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 	return nil
 }
 
-func truncateKey(key []byte, maxLen int) string {
-	if len(key) <= maxLen {
-		return bytesToAsciiOrHex(key)
+func (o *freelistInspectOptions) processLeafPage(p *common.Page, prefixMap map[string]*prefixStats, totalKeys *int) {
+	for i := uint16(0); i < p.Count(); i++ {
+		elem := p.LeafPageElement(i)
+		key := elem.Key()
+		*totalKeys++
+
+		prefix := extractPrefix(key, o.separator, o.segments)
+
+		stats, exists := prefixMap[prefix]
+		if !exists {
+			stats = &prefixStats{prefix: prefix}
+			prefixMap[prefix] = stats
+		}
+		stats.keyCount++
+		stats.byteSize += int64(elem.Ksize() + elem.Vsize())
+		if stats.sampleKey == "" {
+			stats.sampleKey = bytesToAsciiOrHex(key)
+		}
 	}
-	return bytesToAsciiOrHex(key[:maxLen])
+}
+
+func extractPrefix(key []byte, sep string, segments int) string {
+	s := bytesToAsciiOrHex(key)
+	if sep == "" || segments <= 0 {
+		return s
+	}
+
+	count := 0
+	for i := 0; i < len(s); i++ {
+		if strings.HasPrefix(s[i:], sep) {
+			count++
+			if count >= segments {
+				return s[:i]
+			}
+		}
+	}
+	// Fewer segments than requested, return whole key
+	return s
 }
 
 func truncateString(s string, maxLen int) string {
