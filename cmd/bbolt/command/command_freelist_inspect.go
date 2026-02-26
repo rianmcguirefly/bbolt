@@ -22,6 +22,7 @@ type freelistInspectOptions struct {
 	sampleSize   int
 	noProgress   bool
 	dumpOverflow string
+	scanBack     int
 }
 
 func newFreelistInspectCommand() *cobra.Command {
@@ -56,6 +57,7 @@ func (o *freelistInspectOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&o.sampleSize, "sample", 0, "sample N random pages instead of reading all (0 = read all)")
 	fs.BoolVar(&o.noProgress, "no-progress", false, "disable progress indicator")
 	fs.StringVar(&o.dumpOverflow, "dump-overflow", "", "dump unattributed overflow page IDs to file")
+	fs.IntVar(&o.scanBack, "scan-back", 0, "scan back N pages to attribute overflow pages (0 = disabled, try 1000-100000)")
 }
 
 type prefixStats struct {
@@ -168,10 +170,10 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		}
 
 		// Page read failed OR page type unknown - likely an overflow page
-		// Try to find parent leaf page by scanning backwards
+		// Try to find parent leaf page by scanning backwards (if enabled)
 		parentFound := false
 
-		for back := uint64(1); back <= 100000 && uint64(pgid) >= back; back++ {
+		for back := uint64(1); back <= uint64(o.scanBack) && uint64(pgid) >= back; back++ {
 			parentID := uint64(pgid) - back
 			parentPage, _, perr := guts_cli.ReadPage(dbPath, parentID)
 			if perr != nil {
