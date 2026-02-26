@@ -125,6 +125,25 @@ func CmdKvStringer() bolt.KVStringer {
 	return cmdKvStringer{}
 }
 
+// formatSize formats bytes as a human-readable string (e.g., "1.5M", "32K").
+func formatSize(bytes int) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.1fG", float64(bytes)/GB)
+	case bytes >= MB:
+		return fmt.Sprintf("%.1fM", float64(bytes)/MB)
+	case bytes >= KB:
+		return fmt.Sprintf("%.1fK", float64(bytes)/KB)
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
+}
+
 func findLastBucket(tx *bolt.Tx, bucketNames []string) (*bolt.Bucket, error) {
 	lastbucket := tx.Bucket([]byte(bucketNames[0]))
 	if lastbucket == nil {
