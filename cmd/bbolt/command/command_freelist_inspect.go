@@ -20,6 +20,7 @@ type freelistInspectOptions struct {
 	segments     int
 	showKeys     bool
 	sampleSize   int
+	leafLimit    int
 	noProgress   bool
 	dumpOverflow string
 	scanBack     int
@@ -55,6 +56,7 @@ func (o *freelistInspectOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&o.segments, "segments", 2, "number of segments to include in prefix")
 	fs.BoolVar(&o.showKeys, "show-keys", false, "show sample keys for each prefix")
 	fs.IntVar(&o.sampleSize, "sample", 0, "sample N random pages instead of reading all (0 = read all)")
+	fs.IntVar(&o.leafLimit, "leaf-limit", 0, "scan until N leaf pages found (0 = no limit)")
 	fs.BoolVar(&o.noProgress, "no-progress", false, "disable progress indicator")
 	fs.StringVar(&o.dumpOverflow, "dump-overflow", "", "dump unattributed overflow page IDs to file")
 	fs.IntVar(&o.scanBack, "scan-back", 0, "scan back N pages to attribute overflow pages (0 = disabled, try 1000-100000)")
@@ -111,6 +113,8 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 	// Sample pages if requested
 	pagesToScan := freePageIDs
 	sampleRatio := 1.0
+	useLeafLimit := o.leafLimit > 0 && o.sampleSize == 0
+
 	if o.sampleSize > 0 && o.sampleSize < len(freePageIDs) {
 		// Shuffle and take first N
 		shuffled := make([]common.Pgid, len(freePageIDs))
@@ -122,6 +126,8 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		sampleRatio = float64(len(freePageIDs)) / float64(o.sampleSize)
 		fmt.Fprintf(stdout, "Sampling: %d of %d pages (%.1fx extrapolation)\n",
 			o.sampleSize, len(freePageIDs), sampleRatio)
+	} else if useLeafLimit {
+		fmt.Fprintf(stdout, "Scanning until %d leaf pages found...\n", o.leafLimit)
 	}
 	fmt.Fprintln(stdout)
 
@@ -133,6 +139,7 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		overflowPages     int
 		unattributed      int
 		totalKeys         int
+		pagesScanned      int
 		prefixMap         = make(map[string]*prefixStats)
 		unattributedPages []common.Pgid
 	)
@@ -145,10 +152,20 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 	showProgress := !o.noProgress && totalToScan > 1000
 
 	for i, pgid := range pagesToScan {
-		if showProgress && i%progressInterval == 0 {
+		pagesScanned = i + 1
+
+		if useLeafLimit {
+			if leafPages >= o.leafLimit {
+				break
+			}
+			if showProgress && i%1000 == 0 {
+				fmt.Fprintf(stdout, "\rScanning: %d pages, found %d/%d leaves", i, leafPages, o.leafLimit)
+			}
+		} else if showProgress && i%progressInterval == 0 {
 			pct := float64(i) * 100 / float64(totalToScan)
 			fmt.Fprintf(stdout, "\rScanning pages: %.0f%% (%d/%d)", pct, i, totalToScan)
 		}
+
 		p, _, err := guts_cli.ReadPage(dbPath, uint64(pgid))
 
 		// If page read succeeds, classify it
@@ -217,7 +234,14 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 
 	// Clear progress line
 	if showProgress {
-		fmt.Fprintf(stdout, "\r%s\r", strings.Repeat(" ", 50))
+		fmt.Fprintf(stdout, "\r%s\r", strings.Repeat(" ", 60))
+	}
+
+	// Calculate extrapolation ratio for leaf-limit mode
+	if useLeafLimit && pagesScanned > 0 {
+		sampleRatio = float64(len(freePageIDs)) / float64(pagesScanned)
+		fmt.Fprintf(stdout, "Scanned %d pages to find %d leaf pages (%.1fx extrapolation)\n\n",
+			pagesScanned, leafPages, sampleRatio)
 	}
 
 	// Print page type breakdown (extrapolate if sampling)
