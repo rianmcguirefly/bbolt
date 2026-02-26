@@ -125,14 +125,14 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 
 	// Analyze each free page
 	var (
-		leafPages          int
-		branchPages        int
-		otherPages         int
-		overflowPages      int
-		unattributed       int
-		totalKeys          int
-		prefixMap          = make(map[string]*prefixStats)
-		unattributedPages  []common.Pgid
+		leafPages         int
+		branchPages       int
+		freelistPages     int
+		overflowPages     int
+		unattributed      int
+		totalKeys         int
+		prefixMap         = make(map[string]*prefixStats)
+		unattributedPages []common.Pgid
 	)
 
 	totalToScan := len(pagesToScan)
@@ -149,8 +149,8 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		}
 		p, _, err := guts_cli.ReadPage(dbPath, uint64(pgid))
 		if err != nil {
-			// Page might be corrupted or part of overflow
-			otherPages++
+			// Page might be corrupted
+			unattributed++
 			continue
 		}
 
@@ -163,13 +163,14 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 		case p.IsBranchPage():
 			branchPages++
 
+		case p.IsFreelistPage():
+			freelistPages++
+
 		default:
 			// Try to find parent leaf page for overflow pages
-			otherPages++
 			parentFound := false
 
 			// Scan backwards to find parent leaf page (up to 100000 pages back)
-			// Exit early if we hit a leaf/branch page that doesn't cover us
 			for back := uint64(1); back <= 100000 && uint64(pgid) >= back; back++ {
 				parentID := uint64(pgid) - back
 				parentPage, _, err := guts_cli.ReadPage(dbPath, parentID)
@@ -177,40 +178,30 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 					continue
 				}
 
-				// Check if this is a leaf page
-				if parentPage.IsLeafPage() {
-					if uint64(parentPage.Overflow()) >= back {
-						// Found the parent - attribute overflow size to its keys
-						overflowPages++
-						parentFound = true
+				// Check if this is a leaf page that covers our overflow page
+				if parentPage.IsLeafPage() && uint64(parentPage.Overflow()) >= back {
+					// Found the parent - attribute overflow size to its keys
+					overflowPages++
+					parentFound = true
 
-						// Attribute to the last key (usually the large one causing overflow)
-						if parentPage.Count() > 0 {
-							elem := parentPage.LeafPageElement(parentPage.Count() - 1)
-							key := elem.Key()
-							prefix := extractPrefix(key, o.separator, o.segments)
+					// Attribute to the last key (usually the large one causing overflow)
+					if parentPage.Count() > 0 {
+						elem := parentPage.LeafPageElement(parentPage.Count() - 1)
+						key := elem.Key()
+						prefix := extractPrefix(key, o.separator, o.segments)
 
-							stats, exists := prefixMap[prefix]
-							if !exists {
-								stats = &prefixStats{prefix: prefix}
-								prefixMap[prefix] = stats
-							}
-							// Add one page worth of size for this overflow page
-							stats.byteSize += int64(pageSize)
-							if stats.sampleKey == "" {
-								stats.sampleKey = bytesToAsciiOrHex(key)
-							}
+						stats, exists := prefixMap[prefix]
+						if !exists {
+							stats = &prefixStats{prefix: prefix}
+							prefixMap[prefix] = stats
+						}
+						// Add one page worth of size for this overflow page
+						stats.byteSize += int64(pageSize)
+						if stats.sampleKey == "" {
+							stats.sampleKey = bytesToAsciiOrHex(key)
 						}
 					}
-					// Either way, stop - this leaf doesn't cover us or we found our parent
 					break
-				}
-
-				// If we hit a branch page, the parent must be before it, keep searching
-				// But branch pages don't have overflow, so this shouldn't block us
-				if parentPage.IsBranchPage() {
-					// Keep searching - overflow pages belong to leaf pages
-					continue
 				}
 			}
 
@@ -231,31 +222,27 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 	// Print page type breakdown (extrapolate if sampling)
 	fmt.Fprintln(stdout, "Page type breakdown:")
 	if sampleRatio > 1.0 {
-		fmt.Fprintf(stdout, "  Leaf pages:       ~%d (sampled %d)\n", int(float64(leafPages)*sampleRatio), leafPages)
-		fmt.Fprintf(stdout, "  Branch pages:     ~%d (sampled %d)\n", int(float64(branchPages)*sampleRatio), branchPages)
+		fmt.Fprintf(stdout, "  Leaf pages:            ~%d (sampled %d)\n", int(float64(leafPages)*sampleRatio), leafPages)
+		fmt.Fprintf(stdout, "  Branch pages:          ~%d (sampled %d)\n", int(float64(branchPages)*sampleRatio), branchPages)
+		fmt.Fprintf(stdout, "  Old freelist pages:    ~%d (sampled %d)\n", int(float64(freelistPages)*sampleRatio), freelistPages)
 		if overflowPages > 0 {
 			fmt.Fprintf(stdout, "  Overflow (attributed): ~%d (sampled %d)\n", int(float64(overflowPages)*sampleRatio), overflowPages)
 		}
 		if unattributed > 0 {
 			fmt.Fprintf(stdout, "  Overflow (unknown):    ~%d (sampled %d)\n", int(float64(unattributed)*sampleRatio), unattributed)
 		}
-		if otherPages > 0 && otherPages != overflowPages+unattributed {
-			fmt.Fprintf(stdout, "  Other:            ~%d (sampled %d)\n", int(float64(otherPages)*sampleRatio), otherPages)
-		}
-		fmt.Fprintf(stdout, "  Total keys:       ~%d (sampled %d)\n\n", int(float64(totalKeys)*sampleRatio), totalKeys)
+		fmt.Fprintf(stdout, "  Total keys:            ~%d (sampled %d)\n\n", int(float64(totalKeys)*sampleRatio), totalKeys)
 	} else {
-		fmt.Fprintf(stdout, "  Leaf pages:       %d\n", leafPages)
-		fmt.Fprintf(stdout, "  Branch pages:     %d\n", branchPages)
+		fmt.Fprintf(stdout, "  Leaf pages:            %d\n", leafPages)
+		fmt.Fprintf(stdout, "  Branch pages:          %d\n", branchPages)
+		fmt.Fprintf(stdout, "  Old freelist pages:    %d\n", freelistPages)
 		if overflowPages > 0 {
 			fmt.Fprintf(stdout, "  Overflow (attributed): %d\n", overflowPages)
 		}
 		if unattributed > 0 {
 			fmt.Fprintf(stdout, "  Overflow (unknown):    %d\n", unattributed)
 		}
-		if otherPages > 0 && otherPages != overflowPages+unattributed {
-			fmt.Fprintf(stdout, "  Other:            %d\n", otherPages)
-		}
-		fmt.Fprintf(stdout, "  Total keys found: %d\n\n", totalKeys)
+		fmt.Fprintf(stdout, "  Total keys found:      %d\n\n", totalKeys)
 	}
 
 	if len(prefixMap) == 0 {
