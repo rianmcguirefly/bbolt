@@ -148,68 +148,67 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 			fmt.Fprintf(stdout, "\rScanning pages: %.0f%% (%d/%d)", pct, i, totalToScan)
 		}
 		p, _, err := guts_cli.ReadPage(dbPath, uint64(pgid))
-		if err != nil {
-			// Page might be corrupted
-			unattributed++
-			continue
+
+		// If page read succeeds, classify it
+		if err == nil {
+			switch {
+			case p.IsLeafPage():
+				leafPages++
+				o.processLeafPage(p, prefixMap, &totalKeys)
+				continue
+
+			case p.IsBranchPage():
+				branchPages++
+				continue
+
+			case p.IsFreelistPage():
+				freelistPages++
+				continue
+			}
 		}
 
-		switch {
-		case p.IsLeafPage():
-			leafPages++
-			// Extract keys from leaf page
-			o.processLeafPage(p, prefixMap, &totalKeys)
+		// Page read failed OR page type unknown - likely an overflow page
+		// Try to find parent leaf page by scanning backwards
+		parentFound := false
 
-		case p.IsBranchPage():
-			branchPages++
-
-		case p.IsFreelistPage():
-			freelistPages++
-
-		default:
-			// Try to find parent leaf page for overflow pages
-			parentFound := false
-
-			// Scan backwards to find parent leaf page (up to 100000 pages back)
-			for back := uint64(1); back <= 100000 && uint64(pgid) >= back; back++ {
-				parentID := uint64(pgid) - back
-				parentPage, _, err := guts_cli.ReadPage(dbPath, parentID)
-				if err != nil {
-					continue
-				}
-
-				// Check if this is a leaf page that covers our overflow page
-				if parentPage.IsLeafPage() && uint64(parentPage.Overflow()) >= back {
-					// Found the parent - attribute overflow size to its keys
-					overflowPages++
-					parentFound = true
-
-					// Attribute to the last key (usually the large one causing overflow)
-					if parentPage.Count() > 0 {
-						elem := parentPage.LeafPageElement(parentPage.Count() - 1)
-						key := elem.Key()
-						prefix := extractPrefix(key, o.separator, o.segments)
-
-						stats, exists := prefixMap[prefix]
-						if !exists {
-							stats = &prefixStats{prefix: prefix}
-							prefixMap[prefix] = stats
-						}
-						// Add one page worth of size for this overflow page
-						stats.byteSize += int64(pageSize)
-						if stats.sampleKey == "" {
-							stats.sampleKey = bytesToAsciiOrHex(key)
-						}
-					}
-					break
-				}
+		for back := uint64(1); back <= 100000 && uint64(pgid) >= back; back++ {
+			parentID := uint64(pgid) - back
+			parentPage, _, perr := guts_cli.ReadPage(dbPath, parentID)
+			if perr != nil {
+				continue
 			}
 
-			if !parentFound {
-				unattributed++
-				if o.dumpOverflow != "" {
-					unattributedPages = append(unattributedPages, pgid)
+			// Check if this is a leaf page that covers our overflow page
+			if parentPage.IsLeafPage() && uint64(parentPage.Overflow()) >= back {
+				// Found the parent - attribute overflow size to its keys
+				overflowPages++
+				parentFound = true
+
+				// Attribute to the last key (usually the large one causing overflow)
+				if parentPage.Count() > 0 {
+					elem := parentPage.LeafPageElement(parentPage.Count() - 1)
+					key := elem.Key()
+					prefix := extractPrefix(key, o.separator, o.segments)
+
+					stats, exists := prefixMap[prefix]
+					if !exists {
+						stats = &prefixStats{prefix: prefix}
+						prefixMap[prefix] = stats
+					}
+					// Add one page worth of size for this overflow page
+					stats.byteSize += int64(pageSize)
+					if stats.sampleKey == "" {
+						stats.sampleKey = bytesToAsciiOrHex(key)
+					}
 				}
+				break
+			}
+		}
+
+		if !parentFound {
+			unattributed++
+			if o.dumpOverflow != "" {
+				unattributedPages = append(unattributedPages, pgid)
 			}
 		}
 	}
