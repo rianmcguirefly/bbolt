@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
 	"strings"
 
@@ -14,12 +15,13 @@ import (
 )
 
 type freelistInspectOptions struct {
-	limit      int
-	separator  string
-	segments   int
-	showKeys   bool
-	sampleSize int
-	noProgress bool
+	limit        int
+	separator    string
+	segments     int
+	showKeys     bool
+	sampleSize   int
+	noProgress   bool
+	dumpOverflow string
 }
 
 func newFreelistInspectCommand() *cobra.Command {
@@ -53,6 +55,7 @@ func (o *freelistInspectOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.showKeys, "show-keys", false, "show sample keys for each prefix")
 	fs.IntVar(&o.sampleSize, "sample", 0, "sample N random pages instead of reading all (0 = read all)")
 	fs.BoolVar(&o.noProgress, "no-progress", false, "disable progress indicator")
+	fs.StringVar(&o.dumpOverflow, "dump-overflow", "", "dump unattributed overflow page IDs to file")
 }
 
 type prefixStats struct {
@@ -122,13 +125,14 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 
 	// Analyze each free page
 	var (
-		leafPages     int
-		branchPages   int
-		otherPages    int
-		overflowPages int
-		unattributed  int
-		totalKeys     int
-		prefixMap     = make(map[string]*prefixStats)
+		leafPages          int
+		branchPages        int
+		otherPages         int
+		overflowPages      int
+		unattributed       int
+		totalKeys          int
+		prefixMap          = make(map[string]*prefixStats)
+		unattributedPages  []common.Pgid
 	)
 
 	totalToScan := len(pagesToScan)
@@ -164,43 +168,57 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 			otherPages++
 			parentFound := false
 
-			// Scan backwards to find parent leaf page (up to 1000 pages back)
-			for back := uint64(1); back <= 1000 && uint64(pgid) >= back; back++ {
+			// Scan backwards to find parent leaf page (up to 100000 pages back)
+			// Exit early if we hit a leaf/branch page that doesn't cover us
+			for back := uint64(1); back <= 100000 && uint64(pgid) >= back; back++ {
 				parentID := uint64(pgid) - back
 				parentPage, _, err := guts_cli.ReadPage(dbPath, parentID)
 				if err != nil {
 					continue
 				}
 
-				// Check if this page's overflow covers our page
-				if parentPage.IsLeafPage() && uint64(parentPage.Overflow()) >= back {
-					// Found the parent - attribute overflow size to its keys
-					overflowPages++
-					parentFound = true
+				// Check if this is a leaf page
+				if parentPage.IsLeafPage() {
+					if uint64(parentPage.Overflow()) >= back {
+						// Found the parent - attribute overflow size to its keys
+						overflowPages++
+						parentFound = true
 
-					// Attribute to the last key (usually the large one causing overflow)
-					if parentPage.Count() > 0 {
-						elem := parentPage.LeafPageElement(parentPage.Count() - 1)
-						key := elem.Key()
-						prefix := extractPrefix(key, o.separator, o.segments)
+						// Attribute to the last key (usually the large one causing overflow)
+						if parentPage.Count() > 0 {
+							elem := parentPage.LeafPageElement(parentPage.Count() - 1)
+							key := elem.Key()
+							prefix := extractPrefix(key, o.separator, o.segments)
 
-						stats, exists := prefixMap[prefix]
-						if !exists {
-							stats = &prefixStats{prefix: prefix}
-							prefixMap[prefix] = stats
-						}
-						// Add one page worth of size for this overflow page
-						stats.byteSize += int64(pageSize)
-						if stats.sampleKey == "" {
-							stats.sampleKey = bytesToAsciiOrHex(key)
+							stats, exists := prefixMap[prefix]
+							if !exists {
+								stats = &prefixStats{prefix: prefix}
+								prefixMap[prefix] = stats
+							}
+							// Add one page worth of size for this overflow page
+							stats.byteSize += int64(pageSize)
+							if stats.sampleKey == "" {
+								stats.sampleKey = bytesToAsciiOrHex(key)
+							}
 						}
 					}
+					// Either way, stop - this leaf doesn't cover us or we found our parent
 					break
+				}
+
+				// If we hit a branch page, the parent must be before it, keep searching
+				// But branch pages don't have overflow, so this shouldn't block us
+				if parentPage.IsBranchPage() {
+					// Keep searching - overflow pages belong to leaf pages
+					continue
 				}
 			}
 
 			if !parentFound {
 				unattributed++
+				if o.dumpOverflow != "" {
+					unattributedPages = append(unattributedPages, pgid)
+				}
 			}
 		}
 	}
@@ -306,6 +324,20 @@ func (o *freelistInspectOptions) Run(cmd *cobra.Command, dbPath string) error {
 
 	if len(prefixMap) > o.limit {
 		fmt.Fprintf(stdout, "\n... and %d more prefixes\n", len(prefixMap)-o.limit)
+	}
+
+	// Dump unattributed overflow pages if requested
+	if o.dumpOverflow != "" && len(unattributedPages) > 0 {
+		f, err := os.Create(o.dumpOverflow)
+		if err != nil {
+			return fmt.Errorf("failed to create dump file: %w", err)
+		}
+		defer f.Close()
+
+		for _, pgid := range unattributedPages {
+			fmt.Fprintf(f, "%d\n", pgid)
+		}
+		fmt.Fprintf(stdout, "\nDumped %d unattributed overflow page IDs to %s\n", len(unattributedPages), o.dumpOverflow)
 	}
 
 	return nil
